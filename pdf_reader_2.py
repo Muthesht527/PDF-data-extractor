@@ -6,8 +6,19 @@ from pytesseract import Output
 import cv2
 import re
 import shutil
+import hashlib
 
-tess.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # set the path to the Tesseract executable
+Input_DIR = Path("PDF_Input")
+Processed_DIR = Path("Processed_PDFs")
+Temp_DIR = Path("Temp_Img")
+
+Processed_DIR.mkdir(exist_ok=True)
+Temp_DIR.mkdir(exist_ok=True)
+
+pdfs=list(Input_DIR.glob("*.pdf"))
+
+#tesseract must be installed to the PATH or in the program files
+# tess.pytesseract.tesseract_cmd = shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # set the path to the Tesseract executable
 excel_file='student_record.xlsx'
 
 def extract_images(reader, page_index, output_dir):
@@ -298,29 +309,107 @@ def Cert_Page(reader, page_index, output_dir, student_names=None, college_keywor
         # "validity_checks": validity
     }
 
+def process_single_pdf(pdf_path):
+    print(f"Processing: {pdf_path.name}")
 
-with open("Sample project pdf.pdf", "rb") as file:
-    reader = PyPDF2.PdfReader(file)  # parse the PDF structure from the file stream
-    req_pages=[0,2,len(reader.pages)-1] # list of page indices to extract images from (0-based)
-    output_dir = Path("extracted_images")  # create a Path object for the output folder
+    # --- Clean temp directory ---
+    if Temp_DIR.exists():
+        shutil.rmtree(Temp_DIR)
+    Temp_DIR.mkdir()
+
+    with open(pdf_path, "rb") as file:
+        reader = PyPDF2.PdfReader(file)
+        req_pages = [0, 2, len(reader.pages) - 1]
+
+        page1 = Page1(reader, req_pages[0], Temp_DIR)
+        supervisor = Page2(reader, req_pages[1], Temp_DIR)
+        cert_page = Cert_Page(reader,req_pages[2],Temp_DIR,student_names=[s['Name'] for s in page1])
+
+        pdf_id=pdf_hash(pdf_path)
+
+        page1 = pd.DataFrame(page1)
+        page1["Register Number"] = (
+            page1["Register Number"].astype(str).str.strip().str.replace(r"\D", "", regex=True)
+        )
+        page1["PDF_ID"] = pdf_id
+        page1["PDF Name"] = pdf_path.name
+        page2 = pd.DataFrame([{
+            "Supervisor": supervisor,
+            "Certificate Status": cert_page["certificate_present"],
+        }])
+
+        data = page1.merge(page2, how="cross")
+
+    # --- Move processed PDF ---
+    shutil.move(pdf_path,Processed_DIR / pdf_path.name)
+
+    # --- Cleanup temp images ---
+    shutil.rmtree(Temp_DIR)
+
+    print(f"✔ Done: {pdf_path.name}")
+    return data
+
+def Upload_Excel(data, excel_file):
+    if data:
+        final_df = pd.concat(data, ignore_index=True)
+
+        if Path(excel_file).exists():
+            old_df = pd.read_excel(excel_file)
+            final_df = pd.concat([old_df, final_df], ignore_index=True)
+
+        # Prevent duplicate PDFs
+        final_df.drop_duplicates(
+            subset=["PDF_ID", "Register Number"],
+            inplace=True
+        )
+
+        final_df.to_excel(excel_file, index=False)
+
+    print("✅ ALL PDFs PROCESSED")
+
+def pdf_hash(pdf_path):
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+all_data = []
+
+for pdf_path in pdfs:
+    try:
+        df = process_single_pdf(pdf_path)
+        all_data.append(df)
+    except Exception as e:
+        print(f"❌ Failed: {pdf_path.name}")
+        print(e)
+
+Upload_Excel(all_data, excel_file)
+
+
+# with open("Sample project pdf.pdf", "rb") as file:
+#     reader = PyPDF2.PdfReader(file)  # parse the PDF structure from the file stream
+#     req_pages=[0,2,len(reader.pages)-1] # list of page indices to extract images from (0-based)
+#     output_dir = Path("extracted_images")  # create a Path object for the output folder
     
-    page1 = Page1(reader, req_pages[0], output_dir)
-    # print("Students:", page1)
-    page2 = Page2(reader, req_pages[1], output_dir)
-    # print("Supervisor:", page2)
-    cert_page = Cert_Page(reader, req_pages[2], output_dir, student_names=[s['Name'] for s in page1])
-    # print("Certificate Page Analysis:", cert_page)
+#     page1 = Page1(reader, req_pages[0], output_dir)
+#     # print("Students:", page1)
+#     page2 = Page2(reader, req_pages[1], output_dir)
+#     # print("Supervisor:", page2)
+#     cert_page = Cert_Page(reader, req_pages[2], output_dir, student_names=[s['Name'] for s in page1])
+#     # print("Certificate Page Analysis:", cert_page)
 
-    page2 = {'Supervisor': page2,'Certificate Status': cert_page['certificate_present']} if page2 else {}
+#     page2 = {'Supervisor': page2,'Certificate Status': cert_page['certificate_present']} if page2 else {}
 
-    page1=pd.DataFrame(page1)
-    page2=pd.DataFrame([page2]) if page2 else pd.DataFrame()
+#     page1=pd.DataFrame(page1)
+#     page2=pd.DataFrame([page2]) if page2 else pd.DataFrame()
 
-    upload=page1.merge(page2, how='cross')
-    # print(upload)
-    print("Upload done!!!")
+#     upload=page1.merge(page2, how='cross')
+#     # print(upload)
+#     print("Upload done!!!")
     
-    upload.to_excel(excel_file, index=False)
+#     upload.to_excel(excel_file, index=False)
 
 # data=tess.image_to_data(f"extracted_images/page_{page_index+1:03d}_img_001.jpeg", output_type=Output.DATAFRAME)
 # data = data[data.conf > 40]       # remove low confidence
