@@ -1,14 +1,16 @@
 import PyPDF2
-from anyio import Path
+from pathlib import Path
 import pandas as pd
 import pytesseract as tess
 from pytesseract import Output
 import cv2
 import re
+import shutil
 
 tess.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # set the path to the Tesseract executable
+excel_file='student_record.xlsx'
 
-def extract_image(reader, page_index, output_dir):
+def extract_images(reader, page_index, output_dir):
     if len(reader.pages) == 0:  # total number of pages in the PDF
         print("This PDF has no pages.")
     else:
@@ -16,12 +18,19 @@ def extract_image(reader, page_index, output_dir):
         images = getattr(page, "images", None)  # list of embedded images on the page
 
         #Image extraction / saving part
+        if not images:
+            return []
+
+        saved = []
         for img_index, image in enumerate(images, start=1):  # loop images with 1-based index
             ext = getattr(image, "extension", None) or "jpeg"  # file extension for the image
             out_name = f"page_{page_index+1:03d}_img_{img_index:03d}.{ext}"
             out_path = output_dir / out_name
             with open(out_path, "wb") as out_file:
                 out_file.write(image.data)  # raw bytes of the image
+            saved.append(out_path)
+
+        return saved
 
 def extract_title(structured_lines, anchor, max_gap=80):
     report_y = next(
@@ -75,105 +84,219 @@ def extract_student(structured_lines,start_anchor,stop_anchor,max_gap=120):
 
     return students
 
-def Page1(page_index):
+def Page1(reader, page_index, output_dir):
     students_split = []
-    data=tess.image_to_data(f"extracted_images/page_{page_index+1:03d}_img_001.jpeg", output_type=Output.DATAFRAME)
-    data = data[data.conf > 40]       # remove low confidence
-    data = data[data.text.notna()]    # remove empty text
-    data = data[data.text != " "]
 
-    img=cv2.imread(f'extracted_images/page_{page_index+1:03d}_img_001.jpeg')
+    if len(reader.pages) == 0:  # total number of pages in the PDF
+        print("This PDF has no pages.")
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved = extract_images(reader, page_index, output_dir)
+        if not saved:
+            raise FileNotFoundError("No images found on page 1")
 
-    lines = {}
-    structured_lines = []
+        img_path = saved[0]
 
-    for _, row in data.iterrows():
-        x, y, w, h = row['left'], row['top'], row['width'], row['height']
-        cv2.rectangle(img, (x, y), (x+w, y+h), (0,255,0), 1)
-        line_id = (row['block_num'], row['par_num'], row['line_num'])
-        lines.setdefault(line_id, []).append(row)
+        data = tess.image_to_data(str(img_path), output_type=Output.DATAFRAME)
+        
+        data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
+        data = data[data.conf > 40]       # remove low confidence
+        data = data[data.text.notna()]    # remove empty text
+        data = data[data.text.str.strip() != ""]
+
+        img = cv2.imread(str(img_path))
+
+        lines = {}
+        structured_lines = []
+
+        for _, row in data.iterrows():
+            x, y, w, h = row['left'], row['top'], row['width'], row['height']
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0,255,0), 1)
+            line_id = (row['block_num'], row['par_num'], row['line_num'])
+            lines.setdefault(line_id, []).append(row)
 
 
-    for line in lines.values():
-        line = sorted(line, key=lambda r: r['left'])
-        text = " ".join([r['text'] for r in line])
-        y = min(r['top'] for r in line)
+        for line in lines.values():
+            line = sorted(line, key=lambda r: r['left'])
+            text = " ".join([r['text'] for r in line])
+            y = min(r['top'] for r in line)
 
-        structured_lines.append({
-            "text": text,
-            "y": y
-        })
-
-    student_pattern = re.compile(r"(.+?)\s*\((\d+)\)")
-
-    project_title = extract_title(structured_lines, "project report")
-    students = extract_student(structured_lines, "submitted by", "in partial fulfillment")
-
-    for s in students:
-        m = student_pattern.search(s)
-        if m:
-            students_split.append({
-                "name": m.group(1).strip(),
-                "reg_no": m.group(2),
-                "project_title": project_title
+            structured_lines.append({
+                "text": text,
+                "y": y
             })
-    
-    return students_split
 
-def Page2(page_index):
-    img = cv2.imread(f'extracted_images/page_{page_index+1:03d}_img_001.jpeg')
+        project_title = extract_title(structured_lines, "project report")
+        students = extract_student(structured_lines, "submitted by", "in partial fulfillment")
 
+        student_pattern = re.compile(r"(.+?)\s*\((\d+)\)")
+
+        for s in students:
+            m = student_pattern.search(s)
+            if m:
+                students_split.append({
+                    "Name": m.group(1).strip(),
+                    "Register Number": m.group(2),
+                    "Project Title": project_title
+                })
+        
+        return students_split
+
+def Page2(reader, page_index, output_dir):
+
+    if len(reader.pages) == 0:  # total number of pages in the PDF
+        print("This PDF has no pages.")
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved = extract_images(reader, page_index, output_dir)
+        if not saved:
+            raise FileNotFoundError("No images found on supervisor page")
+
+        img = cv2.imread(str(saved[0]))
+
+        if img is None:
+            raise FileNotFoundError("Supervisor page image not found")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
+
+        data = tess.image_to_data(gray, output_type=Output.DATAFRAME)
+
+        data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
+        data = data[
+            (data.conf > 40) &
+            (data.text.notna()) &
+            (data.text.str.strip() != "")
+        ]
+
+        lines = {}
+        for _, row in data.iterrows():
+            key = (row.block_num, row.par_num, row.line_num)
+            lines.setdefault(key, []).append(row)
+
+        structured_lines = []
+        for line in lines.values():
+            line = sorted(line, key=lambda r: r.left)
+            text = " ".join(r.text for r in line)
+            structured_lines.append(text)
+
+        supervisor_idx = None
+
+        for i, text in enumerate(structured_lines):
+            if "supervisor" in text.lower():
+                supervisor_idx = i
+                break
+        
+        if supervisor_idx is not None:
+            combined_text = structured_lines[supervisor_idx]
+
+            # merge next line if it exists
+            if supervisor_idx + 1 < len(structured_lines):
+                combined_text += " " + structured_lines[supervisor_idx + 1]
+        else:
+            combined_text = None
+
+        if combined_text:
+            match = re.search(
+                r"supervisor,\s*(dr\.\s*[a-z\.\s]+)",
+                combined_text,
+                re.IGNORECASE
+            )
+        else:
+            match = None
+
+        if match:
+            return match.group(1).strip()
+
+        return None
+  
+def Cert_Page(reader, page_index, output_dir, student_names=None, college_keywords=None):
+    if student_names is None:
+        student_names = []
+
+    if college_keywords is None:
+        college_keywords = ["rajalakshmi", "anna university"]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved = extract_images(reader, page_index, output_dir)
+    if not saved:
+        raise FileNotFoundError("No images found on certificate page")
+
+    img = cv2.imread(str(saved[0]))
     if img is None:
-        raise FileNotFoundError("Supervisor page image not found")
+        raise FileNotFoundError("Certificate page image not found")
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
 
+    h, w = gray.shape
+
     data = tess.image_to_data(gray, output_type=Output.DATAFRAME)
 
+    data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
     data = data[
         (data.conf > 40) &
         (data.text.notna()) &
-        (data.text != "")
+        (data.text.str.strip() != "")
     ]
 
-    lines = {}
-    for _, row in data.iterrows():
-        key = (row.block_num, row.par_num, row.line_num)
-        lines.setdefault(key, []).append(row)
+    # Normalize text
+    data["text"] = data["text"].str.lower()
 
-    structured_lines = []
-    for line in lines.values():
-        line = sorted(line, key=lambda r: r.left)
-        text = " ".join(r.text for r in line)
-        structured_lines.append(text)
+    certificate_hits = data[data.text.str.contains("certificate", na=False)]
 
-    supervisor_idx = None
+    text_match = len(certificate_hits) > 0
 
-    for i, text in enumerate(structured_lines):
-        if "supervisor" in text.lower():
-            supervisor_idx = i
-            break
-    
-    if supervisor_idx is not None:
-        combined_text = structured_lines[supervisor_idx]
+    layout_match = False
+    large_text_match = False
 
-        # merge next line if it exists
-        if supervisor_idx + 1 < len(structured_lines):
-            combined_text += " " + structured_lines[supervisor_idx + 1]
-    else:
-        combined_text = None
+    for _, row in certificate_hits.iterrows():
+        # near top of page
+        if row.top < 0.25 * h:
+            layout_match = True
 
-    match = re.search(
-        r"supervisor,\s*(dr\.\s*[a-z\.\s]+)",
-        combined_text,
-        re.IGNORECASE
-    )
+        # large text (heading)
+        if row.height > 40:
+            large_text_match = True
 
-    if match:
-        return match.group(1).strip()
+    confidence = sum([
+        text_match,
+        layout_match,
+        large_text_match
+    ])
 
-    return None
+    certificate_present = confidence >= 2
+
+    # ---------------------------
+    # 4. Optional validity checks
+    # ---------------------------
+    # full_text = " ".join(data.text.tolist())
+
+    # validity = {
+    #     "student_name": any(
+    #         name.lower() in full_text
+    #         for name in student_names
+    #     ),
+    #     "college": any(
+    #         kw in full_text
+    #         for kw in college_keywords
+    #     ),
+    #     "signature": any(
+    #         w in full_text
+    #         for w in ["principal", "hod", "signature", "chairman"]
+    #     ),
+    #     "date": bool(
+    #         re.search(r"\b(20\d{2})\b", full_text)
+    #     )
+    # }
+
+    return {
+        "certificate_present": certificate_present,
+        "confidence": confidence,
+        "text_match": text_match,
+        "layout_match": layout_match,
+        # "validity_checks": validity
+    }
 
 
 with open("Sample project pdf.pdf", "rb") as file:
@@ -181,10 +304,23 @@ with open("Sample project pdf.pdf", "rb") as file:
     req_pages=[0,2,len(reader.pages)-1] # list of page indices to extract images from (0-based)
     output_dir = Path("extracted_images")  # create a Path object for the output folder
     
-    page1=Page1(req_pages[0])
-    print("Students:", page1)
-    page2=Page2(req_pages[1])
-    print("Supervisor:", page2)
+    page1 = Page1(reader, req_pages[0], output_dir)
+    # print("Students:", page1)
+    page2 = Page2(reader, req_pages[1], output_dir)
+    # print("Supervisor:", page2)
+    cert_page = Cert_Page(reader, req_pages[2], output_dir, student_names=[s['Name'] for s in page1])
+    # print("Certificate Page Analysis:", cert_page)
+
+    page2 = {'Supervisor': page2,'Certificate Status': cert_page['certificate_present']} if page2 else {}
+
+    page1=pd.DataFrame(page1)
+    page2=pd.DataFrame([page2]) if page2 else pd.DataFrame()
+
+    upload=page1.merge(page2, how='cross')
+    # print(upload)
+    print("Upload done!!!")
+    
+    upload.to_excel(excel_file, index=False)
 
 # data=tess.image_to_data(f"extracted_images/page_{page_index+1:03d}_img_001.jpeg", output_type=Output.DATAFRAME)
 # data = data[data.conf > 40]       # remove low confidence
