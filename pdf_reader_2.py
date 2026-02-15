@@ -1,4 +1,5 @@
 import PyPDF2
+from PyPDF2 import PdfWriter
 from pathlib import Path
 import pandas as pd
 import pytesseract as tess
@@ -7,365 +8,20 @@ import cv2
 import re
 import shutil
 import hashlib
-
-Input_DIR = Path("PDF_Input")
-Processed_DIR = Path("Processed_PDFs")
-Temp_DIR = Path("Temp_Img")
-
-Processed_DIR.mkdir(exist_ok=True)
-Temp_DIR.mkdir(exist_ok=True)
-
-pdfs=list(Input_DIR.glob("*.pdf"))
-
-#tesseract must be installed to the PATH or in the program files
-# tess.pytesseract.tesseract_cmd = shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # set the path to the Tesseract executable
-excel_file='student_record.xlsx'
-
-def extract_images(reader, page_index, output_dir):
-    if len(reader.pages) == 0:  # total number of pages in the PDF
-        print("This PDF has no pages.")
-    else:
-        page = reader.pages[page_index]  # get the requested page (index 0-based)
-        images = getattr(page, "images", None)  # list of embedded images on the page
-
-        #Image extraction / saving part
-        if not images:
-            return []
-
-        saved = []
-        for img_index, image in enumerate(images, start=1):  # loop images with 1-based index
-            ext = getattr(image, "extension", None) or "jpeg"  # file extension for the image
-            out_name = f"page_{page_index+1:03d}_img_{img_index:03d}.{ext}"
-            out_path = output_dir / out_name
-            with open(out_path, "wb") as out_file:
-                out_file.write(image.data)  # raw bytes of the image
-            saved.append(out_path)
-
-        return saved
-
-def extract_title(structured_lines, anchor, max_gap=80):
-    report_y = next(
-        line['y'] for line in structured_lines
-        if anchor in line['text'].lower()
-    )
-
-    above = sorted(
-        [l for l in structured_lines if l['y'] < report_y],
-        key=lambda x: x['y'],
-        reverse=True
-    )
-
-    title_block = []
-    prev_y = None
-
-    for line in above:
-        if prev_y is None or prev_y - line['y'] <= max_gap:
-            title_block.append(line)
-            prev_y = line['y']
-        else:
-            break
-
-    return " ".join(l['text'] for l in reversed(title_block))
-
-def extract_student(structured_lines,start_anchor,stop_anchor,max_gap=120):
-    start_y = next(
-        line['y'] for line in structured_lines
-        if start_anchor in line['text'].lower()
-    )
-
-    candidates = sorted(
-        [l for l in structured_lines if l['y'] > start_y],
-        key=lambda x: x['y']
-    )
-
-    students = []
-    prev_y = None
-
-    for line in candidates:
-        text = line['text'].lower()
-
-        if stop_anchor in text:
-            break
-
-        if prev_y is None or line['y'] - prev_y <= max_gap:
-            students.append(line['text'])
-            prev_y = line['y']
-        else:
-            break
-
-    return students
-
-def Page1(reader, page_index, output_dir):
-    students_split = []
-
-    if len(reader.pages) == 0:  # total number of pages in the PDF
-        print("This PDF has no pages.")
-    else:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        saved = extract_images(reader, page_index, output_dir)
-        if not saved:
-            raise FileNotFoundError("No images found on page 1")
-
-        img_path = saved[0]
-
-        data = tess.image_to_data(str(img_path), output_type=Output.DATAFRAME)
-        
-        data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
-        data = data[data.conf > 40]       # remove low confidence
-        data = data[data.text.notna()]    # remove empty text
-        data = data[data.text.str.strip() != ""]
-
-        img = cv2.imread(str(img_path))
-
-        lines = {}
-        structured_lines = []
-
-        for _, row in data.iterrows():
-            x, y, w, h = row['left'], row['top'], row['width'], row['height']
-            cv2.rectangle(img, (x, y), (x+w, y+h), (0,255,0), 1)
-            line_id = (row['block_num'], row['par_num'], row['line_num'])
-            lines.setdefault(line_id, []).append(row)
-
-
-        for line in lines.values():
-            line = sorted(line, key=lambda r: r['left'])
-            text = " ".join([r['text'] for r in line])
-            y = min(r['top'] for r in line)
-
-            structured_lines.append({
-                "text": text,
-                "y": y
-            })
-
-        project_title = extract_title(structured_lines, "project report")
-        students = extract_student(structured_lines, "submitted by", "in partial fulfillment")
-
-        student_pattern = re.compile(r"(.+?)\s*\((\d+)\)")
-
-        for s in students:
-            m = student_pattern.search(s)
-            if m:
-                students_split.append({
-                    "Name": m.group(1).strip(),
-                    "Register Number": m.group(2),
-                    "Project Title": project_title
-                })
-        
-        return students_split
-
-def Page2(reader, page_index, output_dir):
-
-    if len(reader.pages) == 0:  # total number of pages in the PDF
-        print("This PDF has no pages.")
-    else:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        saved = extract_images(reader, page_index, output_dir)
-        if not saved:
-            raise FileNotFoundError("No images found on supervisor page")
-
-        img = cv2.imread(str(saved[0]))
-
-        if img is None:
-            raise FileNotFoundError("Supervisor page image not found")
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
-
-        data = tess.image_to_data(gray, output_type=Output.DATAFRAME)
-
-        data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
-        data = data[
-            (data.conf > 40) &
-            (data.text.notna()) &
-            (data.text.str.strip() != "")
-        ]
-
-        lines = {}
-        for _, row in data.iterrows():
-            key = (row.block_num, row.par_num, row.line_num)
-            lines.setdefault(key, []).append(row)
-
-        structured_lines = []
-        for line in lines.values():
-            line = sorted(line, key=lambda r: r.left)
-            text = " ".join(r.text for r in line)
-            structured_lines.append(text)
-
-        supervisor_idx = None
-
-        for i, text in enumerate(structured_lines):
-            if "supervisor" in text.lower():
-                supervisor_idx = i
-                break
-        
-        if supervisor_idx is not None:
-            combined_text = structured_lines[supervisor_idx]
-
-            # merge next line if it exists
-            if supervisor_idx + 1 < len(structured_lines):
-                combined_text += " " + structured_lines[supervisor_idx + 1]
-        else:
-            combined_text = None
-
-        if combined_text:
-            match = re.search(
-                r"supervisor,\s*(dr\.\s*[a-z\.\s]+)",
-                combined_text,
-                re.IGNORECASE
-            )
-        else:
-            match = None
-
-        if match:
-            return match.group(1).strip()
-
-        return None
-  
-def Cert_Page(reader, page_index, output_dir, student_names=None, college_keywords=None):
-    if student_names is None:
-        student_names = []
-
-    if college_keywords is None:
-        college_keywords = ["rajalakshmi", "anna university"]
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved = extract_images(reader, page_index, output_dir)
-    if not saved:
-        raise FileNotFoundError("No images found on certificate page")
-
-    img = cv2.imread(str(saved[0]))
-    if img is None:
-        raise FileNotFoundError("Certificate page image not found")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
-
-    h, w = gray.shape
-
-    data = tess.image_to_data(gray, output_type=Output.DATAFRAME)
-
-    data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
-    data = data[
-        (data.conf > 40) &
-        (data.text.notna()) &
-        (data.text.str.strip() != "")
-    ]
-
-    # Normalize text
-    data["text"] = data["text"].str.lower()
-
-    certificate_hits = data[data.text.str.contains("certificate", na=False)]
-
-    text_match = len(certificate_hits) > 0
-
-    layout_match = False
-    large_text_match = False
-
-    for _, row in certificate_hits.iterrows():
-        # near top of page
-        if row.top < 0.25 * h:
-            layout_match = True
-
-        # large text (heading)
-        if row.height > 40:
-            large_text_match = True
-
-    confidence = sum([
-        text_match,
-        layout_match,
-        large_text_match
-    ])
-
-    certificate_present = confidence >= 2
-
-    # ---------------------------
-    # 4. Optional validity checks
-    # ---------------------------
-    # full_text = " ".join(data.text.tolist())
-
-    # validity = {
-    #     "student_name": any(
-    #         name.lower() in full_text
-    #         for name in student_names
-    #     ),
-    #     "college": any(
-    #         kw in full_text
-    #         for kw in college_keywords
-    #     ),
-    #     "signature": any(
-    #         w in full_text
-    #         for w in ["principal", "hod", "signature", "chairman"]
-    #     ),
-    #     "date": bool(
-    #         re.search(r"\b(20\d{2})\b", full_text)
-    #     )
-    # }
-
-    return {
-        "certificate_present": certificate_present,
-        "confidence": confidence,
-        "text_match": text_match,
-        "layout_match": layout_match,
-        # "validity_checks": validity
-    }
-
-def process_single_pdf(pdf_path):
-    print(f"Processing: {pdf_path.name}")
-
-    # --- Clean temp directory ---
-    if Temp_DIR.exists():
-        shutil.rmtree(Temp_DIR)
-    Temp_DIR.mkdir()
-
-    with open(pdf_path, "rb") as file:
-        reader = PyPDF2.PdfReader(file)
-        req_pages = [0, 2, len(reader.pages) - 1]
-
-        page1 = Page1(reader, req_pages[0], Temp_DIR)
-        supervisor = Page2(reader, req_pages[1], Temp_DIR)
-        cert_page = Cert_Page(reader,req_pages[2],Temp_DIR,student_names=[s['Name'] for s in page1])
-
-        pdf_id=pdf_hash(pdf_path)
-
-        page1 = pd.DataFrame(page1)
-        page1["Register Number"] = (
-            page1["Register Number"].astype(str).str.strip().str.replace(r"\D", "", regex=True)
-        )
-        page1["PDF_ID"] = pdf_id
-        page1["PDF Name"] = pdf_path.name
-        page2 = pd.DataFrame([{
-            "Supervisor": supervisor,
-            "Certificate Status": cert_page["certificate_present"],
-        }])
-
-        data = page1.merge(page2, how="cross")
-
-    # --- Move processed PDF ---
-    shutil.move(pdf_path,Processed_DIR / pdf_path.name)
-
-    # --- Cleanup temp images ---
-    shutil.rmtree(Temp_DIR)
-
-    print(f"✔ Done: {pdf_path.name}")
-    return data
-
-def Upload_Excel(data, excel_file):
-    if data:
-        final_df = pd.concat(data, ignore_index=True)
-
-        if Path(excel_file).exists():
-            old_df = pd.read_excel(excel_file)
-            final_df = pd.concat([old_df, final_df], ignore_index=True)
-
-        # Prevent duplicate PDFs
-        final_df.drop_duplicates(
-            subset=["PDF_ID", "Register Number"],
-            inplace=True
-        )
-
-        final_df.to_excel(excel_file, index=False)
-
-    print("✅ ALL PDFs PROCESSED")
+from openpyxl import load_workbook
+
+INPUT_DIR = Path("PDF_Input")
+PROCESSED_DIR = Path("Processed_PDFs")
+TEMP_DIR = Path("Temp_Img")
+CERT_DIR = Path("Certificates")
+
+INPUT_DIR.mkdir(exist_ok=True)
+PROCESSED_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True)
+CERT_DIR.mkdir(exist_ok=True)
+
+pdfs = list(INPUT_DIR.glob("*.pdf"))
+excel_file = "student_record.xlsx"
 
 def pdf_hash(pdf_path):
     h = hashlib.sha256()
@@ -374,83 +30,317 @@ def pdf_hash(pdf_path):
             h.update(chunk)
     return h.hexdigest()
 
+def preprocess_for_ocr(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
+
+    try:
+        osd = tess.image_to_osd(gray)
+        rotation = int(re.search(r"Rotate: (\d+)", osd).group(1))
+
+        if rotation == 90:
+            gray = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == 180:
+            gray = cv2.rotate(gray, cv2.ROTATE_180)
+        elif rotation == 270:
+            gray = cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    except:
+        pass
+
+    return gray
+
+def extract_images(reader, page_index, output_dir):
+    page = reader.pages[page_index]
+    images = getattr(page, "images", None)
+    if not images:
+        return []
+
+    saved = []
+    for i, image in enumerate(images, start=1):
+        ext = getattr(image, "extension", None) or "jpeg"
+        path = output_dir / f"page_{page_index+1:03d}_img_{i:03d}.{ext}"
+        with open(path, "wb") as f:
+            f.write(image.data)
+        saved.append(path)
+    return saved
+
+def Page1(reader, page_index, output_dir):
+    saved = extract_images(reader, page_index, output_dir)
+    if not saved:
+        raise FileNotFoundError("No image on page 1")
+
+    data = tess.image_to_data(str(saved[0]), output_type=Output.DATAFRAME)
+    data["conf"] = pd.to_numeric(data["conf"], errors="coerce")
+    data = data[(data.conf > 40) & data.text.notna() & (data.text.str.strip() != "")]
+
+    lines = {}
+    for _, r in data.iterrows():
+        key = (r.block_num, r.par_num, r.line_num)
+        lines.setdefault(key, []).append(r)
+
+    structured = []
+    for line in lines.values():
+        line = sorted(line, key=lambda r: r.left)
+        structured.append({
+            "text": " ".join(r.text for r in line),
+            "y": min(r.top for r in line)
+        })
+
+    # Project title
+    report_y = next(l["y"] for l in structured if "project report" in l["text"].lower())
+    title_lines = [l for l in structured if l["y"] < report_y]
+    title = " ".join(l["text"] for l in title_lines[-3:])
+
+    # Students
+    start_y = next(l["y"] for l in structured if "submitted by" in l["text"].lower())
+    students = []
+
+    students = []
+
+    for l in structured:
+        if l["y"] > start_y and "partial fulfillment" not in l["text"].lower():
+
+            text_line = l["text"].strip()
+
+            # FORMAT 1 → With brackets
+            m1 = re.search(r"([A-Za-z\s]+)\s*\((\d{10,15})\)", text_line)
+
+            # FORMAT 2 → Without brackets
+            m2 = re.search(r"([A-Za-z\s]+)\s+(\d{10,15})$", text_line)
+
+            match = m1 if m1 else m2
+
+            if match:
+                students.append({
+                    "Name": match.group(1).strip(),
+                    "Register Number": match.group(2),
+                    "Project Title": title
+                })
+
+
+    return students
+
+def Page2(reader, page_index, output_dir):
+    if page_index >= len(reader.pages):
+        return None
+
+    saved = extract_images(reader, page_index, output_dir)
+    if not saved:
+        return None
+
+    img = cv2.imread(str(saved[0]))
+    gray = preprocess_for_ocr(img)
+
+    text = tess.image_to_string(gray, config="--psm 6").lower()
+    m = re.search(r"supervisor,\s*(dr\.\s*[a-z.\s]+)", text)
+    if m==None:
+        m = re.search(r"mentor,\s*(dr\.\s*[a-z.\s]+)", text)
+    return m.group(1).strip() if m else None
+
+def is_certificate_page(reader, page_index):
+    saved = extract_images(reader, page_index, TEMP_DIR)
+    if not saved:
+        return False, None, None
+
+    img = cv2.imread(str(saved[0]))
+    gray = preprocess_for_ocr(img)
+
+    text = tess.image_to_string(gray, config="--psm 6").lower()
+
+    # ❌ Exclude Bonafide / Academic internal certificate
+    if "bonafide certificate" in text:
+        return False, None, None
+
+    if "project report" in text:
+        return False, None, None
+
+    # =========================
+    # JOURNAL PUBLICATION LOGIC
+    # =========================
+    journal_score = 0
+
+    if "certificate of publication" in text:
+        journal_score += 2
+
+    if "issn" in text:
+        journal_score += 1
+
+    if "volume" in text and "issue" in text:
+        journal_score += 1
+
+    if "published in" in text:
+        journal_score += 1
+
+    if journal_score >= 2:
+        return True, "journal_publication", text
+
+    # =========================
+    # CONFERENCE LOGIC
+    # =========================
+    conference_score = 0
+
+    if "certificate of participation" in text:
+        conference_score += 2
+
+    if "conference" in text:
+        conference_score += 1
+
+    if "presented a paper" in text:
+        conference_score += 1
+
+    if "organized by" in text:
+        conference_score += 1
+
+    if re.search(r"\b\d{4}\b", text):  # year detection
+        conference_score += 1
+
+    if conference_score >= 2:
+        return True, "conference", text
+
+    return False, None, None
+
+def save_certificate(reader, page_index, filename):
+    writer = PdfWriter()
+    writer.add_page(reader.pages[page_index])
+    with open(filename, "wb") as f:
+        writer.write(f)
+
+def extract_certificates(reader, pdf_id, pdf_name, student_names, supervisor, max_pages=15):
+    certs = []
+    start = max(0, len(reader.pages) - max_pages)
+
+    for i in reversed(range(start, len(reader.pages))):
+
+        ok, cert_category, text = is_certificate_page(reader, i)
+        if not ok:
+            continue
+
+        cert_role = "unknown"
+        cert_name = None
+
+        # 🔹 Match student names
+        for s in student_names:
+            if s.lower() in text:
+                cert_role = "student"
+                cert_name = s
+                break
+
+        # 🔹 Match supervisor
+        if cert_role == "unknown" and supervisor and supervisor.lower() in text:
+            cert_role = "supervisor"
+            cert_name = supervisor
+
+        safe = cert_name.replace(" ", "_") if cert_name else "unknown"
+
+        fname = CERT_DIR / f"{pdf_id}_{cert_category}_{cert_role}_{safe}_page{i+1}.pdf"
+        save_certificate(reader, i, fname)
+
+        certs.append({
+            "category": cert_category,
+            "role": cert_role,
+            "name": cert_name,
+            "path": fname.as_posix()
+        })
+
+    return certs
+
+def apply_hyperlinks(excel_file, columns):
+    wb = load_workbook(excel_file)
+    ws = wb.active
+    headers = [c.value for c in ws[1]]
+
+    for col in columns:
+        if col not in headers:
+            continue
+        idx = headers.index(col) + 1
+        for r in range(2, ws.max_row + 1):
+            cell = ws.cell(r, idx)
+            if cell.value:
+                link = str(cell.value).split(";")[0]
+                cell.value = link
+                cell.hyperlink = link
+                cell.style = "Hyperlink"
+    wb.save(excel_file)
+
+def process_single_pdf(pdf_path):
+    print(f"Processing: {pdf_path.name}")
+
+    if TEMP_DIR.exists():
+        shutil.rmtree(TEMP_DIR)
+    TEMP_DIR.mkdir()
+
+    reader = PyPDF2.PdfReader(pdf_path)
+    pdf_id = pdf_hash(pdf_path)
+
+    students = Page1(reader, 0, TEMP_DIR)
+    supervisor = Page2(reader, 1, TEMP_DIR)
+
+    certs = extract_certificates(
+        reader,
+        pdf_id,
+        pdf_path.name,
+        [s["Name"] for s in students],
+        supervisor
+    )
+
+    df = pd.DataFrame(students)
+    df["Register Number"] = df["Register Number"].str.replace(r"\D", "", regex=True)
+    df["PDF_ID"] = pdf_id
+    df["PDF Name"] = pdf_path.name
+    df["PDF Link"] = f"Processed_PDFs/{pdf_path.name}"
+
+    df["Student Certificate Links"] = df["Name"].apply(
+        lambda n: "; ".join(
+            c["path"] for c in certs
+            if c["role"] == "student" and c["name"] == n
+        )
+    )
+
+    sup_links = "; ".join(
+        c["path"] for c in certs
+        if c["role"] == "supervisor"
+    )
+
+    df["Supervisor"] = supervisor
+    df["Supervisor Certificate Links"] = sup_links if sup_links else None
+
+    shutil.move(pdf_path, PROCESSED_DIR / pdf_path.name)
+    shutil.rmtree(TEMP_DIR)
+
+    return df
+
+def upload_excel(all_data):
+    if not all_data:
+        return
+
+    df = pd.concat(all_data, ignore_index=True)
+
+    if Path(excel_file).exists():
+        old = pd.read_excel(excel_file)
+        df = pd.concat([old, df], ignore_index=True)
+
+    df.drop_duplicates(subset=["PDF_ID", "Register Number"], inplace=True)
+    df.to_excel(excel_file, index=False)
+
+    apply_hyperlinks(
+        excel_file,
+        ["PDF Link", "Student Certificate Links", "Supervisor Certificate Links"]
+    )
+
+    print("✅ ALL PDFs PROCESSED")
+
+# ==============================
+# MAIN
+# ==============================
 
 all_data = []
 
-for pdf_path in pdfs:
+for pdf in pdfs:
     try:
-        df = process_single_pdf(pdf_path)
-        all_data.append(df)
+        all_data.append(process_single_pdf(pdf))
     except Exception as e:
-        print(f"❌ Failed: {pdf_path.name}")
+        print(f"❌ Failed: {pdf.name}")
         print(e)
 
-Upload_Excel(all_data, excel_file)
-
-
-# with open("Sample project pdf.pdf", "rb") as file:
-#     reader = PyPDF2.PdfReader(file)  # parse the PDF structure from the file stream
-#     req_pages=[0,2,len(reader.pages)-1] # list of page indices to extract images from (0-based)
-#     output_dir = Path("extracted_images")  # create a Path object for the output folder
-    
-#     page1 = Page1(reader, req_pages[0], output_dir)
-#     # print("Students:", page1)
-#     page2 = Page2(reader, req_pages[1], output_dir)
-#     # print("Supervisor:", page2)
-#     cert_page = Cert_Page(reader, req_pages[2], output_dir, student_names=[s['Name'] for s in page1])
-#     # print("Certificate Page Analysis:", cert_page)
-
-#     page2 = {'Supervisor': page2,'Certificate Status': cert_page['certificate_present']} if page2 else {}
-
-#     page1=pd.DataFrame(page1)
-#     page2=pd.DataFrame([page2]) if page2 else pd.DataFrame()
-
-#     upload=page1.merge(page2, how='cross')
-#     # print(upload)
-#     print("Upload done!!!")
-    
-#     upload.to_excel(excel_file, index=False)
-
-# data=tess.image_to_data(f"extracted_images/page_{page_index+1:03d}_img_001.jpeg", output_type=Output.DATAFRAME)
-# data = data[data.conf > 40]       # remove low confidence
-# data = data[data.text.notna()]    # remove empty text
-# data = data[data.text != " "]
-
-# img=cv2.imread(f'extracted_images/page_{page_index+1:03d}_img_001.jpeg')
-
-# lines = {}
-# structured_lines = []
-
-# for _, row in data.iterrows():
-#     x, y, w, h = row['left'], row['top'], row['width'], row['height']
-#     cv2.rectangle(img, (x, y), (x+w, y+h), (0,255,0), 1)
-#     line_id = (row['block_num'], row['par_num'], row['line_num'])
-#     lines.setdefault(line_id, []).append(row)
-
-
-# for line in lines.values():
-#     line = sorted(line, key=lambda r: r['left'])
-#     text = " ".join([r['text'] for r in line])
-#     y = min(r['top'] for r in line)
-
-#     structured_lines.append({
-#         "text": text,
-#         "y": y
-#     })
-
-# student_pattern = re.compile(r"(.+?)\s*\((\d+)\)")
-# students_split = []
-
-# project_title = extract_title(structured_lines, "project report")
-# students = extract_student(structured_lines, "submitted by", "in partial fulfillment")
-
-# for s in students:
-#     m = student_pattern.search(s)
-#     if m:
-#         students_split.append({
-#             "name": m.group(1).strip(),
-#             "reg_no": m.group(2),
-#             "project_title": project_title
-#         })
-
-# print("Students:", students_split)
+upload_excel(all_data)
